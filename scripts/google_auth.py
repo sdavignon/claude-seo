@@ -16,9 +16,12 @@ Usage:
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from typing import Optional
@@ -50,6 +53,7 @@ OAUTH_SCOPES = (
     "https://www.googleapis.com/auth/analytics.readonly"
 )
 OAUTH_REDIRECT_URI = "http://localhost:8085"
+READ_ONLY_OAUTH_SCOPES = SCOPES['gsc_readonly'] + ' ' + SCOPES['ga4']
 
 # Human-readable service names
 SERVICE_NAMES = {
@@ -361,7 +365,36 @@ def get_oauth_credentials(scopes: list):
     return get_service_account_credentials(scopes)
 
 
-def run_oauth_flow(creds_path: str):
+def _oauth_authorization(client: dict, read_only: bool = False):
+    """Build a fresh state-bound S256 PKCE request; never return a client secret."""
+    import urllib.parse
+
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode('ascii')).digest()).rstrip(b'=').decode('ascii')
+    query = urllib.parse.urlencode({
+        'client_id': client['client_id'], 'redirect_uri': OAUTH_REDIRECT_URI,
+        'response_type': 'code', 'scope': READ_ONLY_OAUTH_SCOPES if read_only else OAUTH_SCOPES,
+        'access_type': 'offline', 'prompt': 'consent', 'state': state,
+        'code_challenge': challenge, 'code_challenge_method': 'S256',
+    })
+    return 'https://accounts.google.com/o/oauth2/auth?' + query, state, verifier
+
+
+def _oauth_callback_code(path: str, state: str) -> Optional[str]:
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(path)
+    params = urllib.parse.parse_qs(parsed.query)
+    returned = params.get('state', [])
+    codes = params.get('code', [])
+    if (parsed.path != '/' or len(returned) != 1 or len(codes) != 1
+            or 'error' in params or not secrets.compare_digest(returned[0].encode(), state.encode())):
+        return None
+    return codes[0]
+
+
+def run_oauth_flow(creds_path: str, read_only: bool = False):
     """
     Run OAuth browser-based authentication flow.
 
@@ -381,26 +414,20 @@ def run_oauth_flow(creds_path: str):
         print("Error: Could not load OAuth client credentials.", file=sys.stderr)
         sys.exit(1)
 
-    auth_url = (
-        f"{client.get('auth_uri', 'https://accounts.google.com/o/oauth2/auth')}"
-        f"?client_id={client['client_id']}"
-        f"&redirect_uri={urllib.parse.quote(OAUTH_REDIRECT_URI)}"
-        f"&response_type=code"
-        f"&scope={urllib.parse.quote(OAUTH_SCOPES)}"
-        f"&access_type=offline&prompt=consent"
-    )
+    auth_url, state, verifier = _oauth_authorization(client, read_only)
 
     auth_code = [None]
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            if "code" in params:
-                auth_code[0] = params["code"][0]
+            code = _oauth_callback_code(self.path, state)
+            if code:
+                auth_code[0] = code
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(b"<h1>Authentication successful!</h1><p>Close this tab.</p>")
+                self.wfile.write(b"<h1>Authorization received.</h1><p>Close this tab and check the application for the final result.</p>")
             else:
                 self.send_response(400)
                 self.end_headers()
@@ -408,7 +435,7 @@ def run_oauth_flow(creds_path: str):
             pass
 
     server = http.server.HTTPServer(("localhost", 8085), Handler)
-    server.timeout = 300
+    server.timeout = 1
 
     print(f"\nOpen this URL in your browser:\n\n{auth_url}\n")
     print("Waiting up to 5 minutes for authentication...")
@@ -418,21 +445,24 @@ def run_oauth_flow(creds_path: str):
     except Exception:
         pass
 
-    server.handle_request()
-    server.server_close()
+    deadline = time.monotonic() + 300
+    try:
+        while not auth_code[0] and time.monotonic() < deadline:
+            server.handle_request()
+    finally:
+        server.server_close()
 
     if not auth_code[0]:
         print("\nAuthentication failed or timed out.", file=sys.stderr)
-        print("If the browser showed 'localhost refused to connect', copy the full URL")
-        print("from the browser address bar and run:")
-        print(f"  python scripts/google_auth.py --exchange --creds {creds_path} --code 'THE_CODE'")
+        print("Rerun --auth to start a fresh local callback. Do not copy callback URLs or codes into chat.")
         sys.exit(1)
 
     # Exchange code for tokens
-    _exchange_code(client, auth_code[0], creds_path)
+    _exchange_code(client, auth_code[0], creds_path, code_verifier=verifier)
 
 
-def _exchange_code(client: dict, code: str, creds_path: Optional[str] = None):
+def _exchange_code(client: dict, code: str, creds_path: Optional[str] = None,
+                   code_verifier: Optional[str] = None):
     """Exchange an authorization code for tokens.
 
     If creds_path is provided, persist its absolute path to the user config
@@ -442,13 +472,16 @@ def _exchange_code(client: dict, code: str, creds_path: Optional[str] = None):
     import urllib.parse
     import urllib.request
 
-    params = urllib.parse.urlencode({
+    fields = {
         "code": code,
         "client_id": client["client_id"],
         "client_secret": client["client_secret"],
         "redirect_uri": OAUTH_REDIRECT_URI,
         "grant_type": "authorization_code",
-    }).encode()
+    }
+    if code_verifier:
+        fields['code_verifier'] = code_verifier
+    params = urllib.parse.urlencode(fields).encode()
 
     try:
         req = urllib.request.Request(
@@ -478,8 +511,8 @@ def _exchange_code(client: dict, code: str, creds_path: Optional[str] = None):
                 )
 
         print(f"\nToken saved to: {TOKEN_PATH}")
-    except Exception as e:
-        print(f"Error exchanging authorization code: {e}", file=sys.stderr)
+    except Exception:
+        print("Error exchanging authorization code. Start a fresh --auth flow; provider response details are not logged.", file=sys.stderr)
         sys.exit(1)
 
 
@@ -592,8 +625,18 @@ def check_credentials(service: str) -> dict:
         # Check OAuth token first
         token_data = _load_oauth_token()
         if token_data and token_data.get("access_token"):
-            result["available"] = True
             result["method"] = "oauth_token"
+            raw_scope = token_data.get('scope')
+            known = isinstance(raw_scope, str) and bool(raw_scope.strip())
+            scopes = set(raw_scope.split()) if known else set()
+            required = {'gsc': {SCOPES['gsc_readonly'], SCOPES['gsc_write']},
+                        'ga4': {SCOPES['ga4']}, 'indexing': {SCOPES['indexing']}}
+            result['scope_status'] = ('granted' if scopes & required[service]
+                                      else 'missing' if known else 'unknown')
+            result['available'] = result['scope_status'] == 'granted'
+            if not result['available']:
+                result['error'] = ('OAuth scope metadata is absent; service access is unknown. Reauthorize or verify explicitly.'
+                                   if not known else 'OAuth token lacks the required service scope.')
             expired = time.time() > token_data.get("expires_at", 0) - 60
             if expired and token_data.get("refresh_token"):
                 result["note"] = "Token expired but refresh_token available (will auto-refresh)"
@@ -638,88 +681,31 @@ def check_credentials(service: str) -> dict:
     else:
         result["error"] = f"Unknown service: {service}"
 
+    result['configured'] = result['available']
+    result['verified'] = False
+    result['verification'] = 'Local credential inspection only; no live API or property access was verified.'
     return result
 
 
 def detect_tier() -> dict:
-    """
-    Detect the credential tier available.
-
-    Returns:
-        Dictionary with:
-            - tier: 0, 1, or 2
-            - description: human-readable tier description
-            - capabilities: list of available API groups
-            - missing: what's needed for the next tier
-    """
-    config = load_config()
-
-    has_api_key = bool(config.get("api_key"))
-    has_authenticated = False
-    has_ga4 = False
-    # Check OAuth token
-    token_data = _load_oauth_token()
-    if token_data and token_data.get("access_token"):
-        has_authenticated = True
-
-    # Check service account
-    if not has_authenticated:
-        sa_path = config.get("service_account_path")
-        if sa_path:
-            sa_path = os.path.expanduser(sa_path)
-            if os.path.exists(sa_path):
-                try:
-                    with open(sa_path, "r") as f:
-                        sa_data = json.load(f)
-                    if "client_email" in sa_data and "private_key" in sa_data:
-                        has_authenticated = True
-                except (json.JSONDecodeError, IOError):
-                    pass
-
-    if has_authenticated and config.get("ga4_property_id"):
-        has_ga4 = True
-
-    if has_ga4:
-        return {
-            "tier": 2,
-            "description": "Full (API key + Service Account + GA4)",
-            "capabilities": [
-                "PageSpeed Insights", "CrUX", "CrUX History",
-                "Search Console", "URL Inspection", "Sitemaps",
-                "Indexing API", "GA4 Organic Traffic",
-            ],
-            "missing": None,
-        }
-    elif has_authenticated:
-        return {
-            "tier": 1,
-            "description": "Authenticated (API key + OAuth/Service Account)",
-            "capabilities": [
-                "PageSpeed Insights", "CrUX", "CrUX History",
-                "Search Console", "URL Inspection", "Sitemaps",
-                "Indexing API",
-            ],
-            "missing": "Add 'ga4_property_id' to unlock GA4 organic traffic reports",
-        }
-    elif has_api_key:
-        return {
-            "tier": 0,
-            "description": "API Key Only",
-            "capabilities": [
-                "PageSpeed Insights", "CrUX", "CrUX History",
-            ],
-            "missing": "Add a service account to unlock Search Console, URL Inspection, and Indexing API",
-        }
-    else:
-        return {
-            "tier": -1,
-            "description": "No credentials configured",
-            "capabilities": [],
-            "missing": (
-                f"Create config at {CONFIG_PATH} with at minimum an 'api_key' field. "
-                "Run with --setup for full instructions."
-            ),
-        }
+    """Report locally configured capabilities, never live verification."""
+    statuses = {service: check_credentials(service) for service in SERVICE_AUTH}
+    labels = {'psi': ['PageSpeed Insights'], 'crux': ['CrUX'],
+              'crux_history': ['CrUX History'],
+              'gsc': ['Search Console', 'URL Inspection', 'Sitemaps (read)'],
+              'ga4': ['GA4 Organic Traffic'], 'indexing': ['Indexing API']}
+    capabilities = [label for service, labels_for_service in labels.items()
+                    if statuses[service]['configured'] for label in labels_for_service]
+    tier = (2 if statuses['ga4']['configured'] else
+            1 if statuses['gsc']['configured'] or statuses['indexing']['configured'] else
+            0 if statuses['psi']['configured'] else -1)
+    return {
+        'tier': tier,
+        'description': 'Locally configured credentials; API and property access unverified',
+        'capabilities': capabilities,
+        'verified': False,
+        'missing': 'Verify each requested API and property with a read-only call before claiming access.',
+    }
 
 
 def print_setup_instructions():
@@ -822,13 +808,17 @@ def main():
         help="Authorization code to exchange (for --exchange)",
     )
 
+    parser.add_argument('--read-only', action='store_true',
+                        help='With --auth, request only Search Console and Analytics read-only scopes')
     args = parser.parse_args()
+    if args.read_only and not args.auth:
+        parser.error('--read-only requires --auth')
 
     if args.auth:
         if not args.creds:
             print("Error: --creds is required with --auth", file=sys.stderr)
             sys.exit(1)
-        run_oauth_flow(args.creds)
+        run_oauth_flow(args.creds, read_only=args.read_only)
         return
 
     if args.exchange:
@@ -879,7 +869,7 @@ def main():
             print(f"Credential Tier: {tier_info['tier']} -- {tier_info['description']}")
             print()
             for svc, result in results.items():
-                status = "OK" if result["available"] else "MISSING"
+                status = "CONFIGURED" if result["available"] else "MISSING OR UNKNOWN"
                 print(f"  [{status}] {result.get('service', svc)}")
                 if result.get("error"):
                     print(f"         {result['error']}")
