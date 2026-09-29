@@ -2,6 +2,11 @@
 
 # Claude SEO: SEO Skill for Claude Code
 
+**Codex support:** [Install and run the Codex adaptation](docs/CODEX.md) with
+`python scripts/install_codex.py`. It installs 33 unique core and extension skills,
+preserves existing installations unless replacement is requested, and includes a
+Python launcher for Windows, macOS and Linux. Provider setup remains separate.
+
 **Claude SEO is an open-source SEO analysis plugin for [Claude Code](https://claude.ai/claude-code).** It runs 26 sub-skills and 19 specialist agents in parallel across technical SEO, content quality (E-E-A-T), Schema.org markup, AI search optimization (GEO), local SEO, e-commerce, and international SEO. Every audit produces a prioritized action plan with testable recommendations grounded in primary-source guidance from Google.
 
 [![CI](https://github.com/AgriciDaniel/claude-seo/actions/workflows/ci.yml/badge.svg)](https://github.com/AgriciDaniel/claude-seo/actions/workflows/ci.yml)

@@ -7,6 +7,17 @@
 >
 > Claude Code users: see `CLAUDE.md` instead.
 
+## Codex
+
+Use [the Codex installation and runtime guide](docs/CODEX.md). Install with
+`python scripts/install_codex.py`; use `python scripts/codex-seo.py` for repository
+runtime commands. Discover current tools and schemas, do not assume Claude tool
+aliases. Read role prompts before any permitted delegation, limit to three
+concurrent child agents or the lower host limit, and fall back to inline work.
+Run schema validation explicitly: copying Claude hooks does not register Codex hooks.
+Verify connector entitlement and property access before use; never trigger paid
+provider calls automatically. The generated skills carry this execution contract.
+
 ## Cross-platform portability (v2.0.0)
 
 Every skill in `skills/*/SKILL.md` is authored to a portable subset of the
@@ -30,7 +41,7 @@ descriptive comments) that other harnesses may ignore but do not reject.
 | **Google Antigravity** | Point the workspace at this repo root; Antigravity reads `AGENTS.md` first, falls back to `skills/`. |
 | **Gemini CLI** | `gemini init` in this repo loads `AGENTS.md`. Skills are activated via `activate_skill <name>` in conversation. |
 | **Grok Build** | Open this repository in Grok Build. It reads `AGENTS.md` and Claude Code compatible plugins and skills without a separate layout. Use `grok inspect` to verify discovery. See the [official compatibility guide](https://docs.x.ai/build/features/skills-plugins-marketplaces). |
-| **OpenAI Codex CLI** | Reads `AGENTS.md` from project root. Bash tools work as documented; some Claude-specific tool names (Read/Write/Edit) are aliased to Codex equivalents transparently. |
+| **OpenAI Codex CLI** | Reads `AGENTS.md`; use `scripts/install_codex.py` and the Python launcher. Discover actual tools; no automatic Claude aliases or hooks. |
 | **Cline** | Loads `AGENTS.md` from project root. Skills appear as system messages; subagent delegation falls back to in-context expansion. |
 | **Aider** | Reads `AGENTS.md` if present; otherwise falls back to README. Aider does not support sub-agent dispatch; the seo-* skills run inline. |
 
@@ -49,8 +60,8 @@ Where claude-seo skills mention Claude Code tools (`Read`, `Write`, `Edit`,
 | Grep       | grep             | search_files    | /grep           | grep |
 | WebFetch   | fetch / browse   | (browser tool)  | (n/a)           | fetch |
 
-These mappings are automatic in most harnesses; we list them for transparency
-in case a recipe needs a specific call.
+These are illustrative capabilities, not guaranteed callable tool names or aliases.
+In Codex always inspect the current tool inventory and schema before calling a tool.
 
 ## Overview
 
